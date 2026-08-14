@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>coding-trainer</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        background: #0b0f14; color: #e6edf3;
+        font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      #gate { min-height: 100%; display: grid; place-items: center; padding: 24px; }
+      .card { width: 100%; max-width: 380px; }
+      h1 { font-size: 20px; margin: 0 0 6px; letter-spacing: -0.01em; }
+      p.sub { margin: 0 0 22px; color: #8b98a5; font-size: 13px; }
+      label { display: block; font-size: 12px; color: #8b98a5; margin-bottom: 6px; }
+      input[type=password] {
+        width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid #2a3441;
+        background: #111820; color: #e6edf3; font-size: 15px; font-family: inherit;
+      }
+      input[type=password]:focus { outline: none; border-color: #3b82f6; }
+      .row { display: flex; align-items: center; gap: 8px; margin: 14px 0 18px; }
+      .row label { margin: 0; font-size: 13px; color: #b6c2cf; }
+      button {
+        width: 100%; padding: 11px 12px; border-radius: 8px; border: 0;
+        background: #3b82f6; color: #fff; font-size: 15px; font-weight: 500;
+        font-family: inherit; cursor: pointer;
+      }
+      button:disabled { opacity: 0.6; cursor: default; }
+      .msg { margin-top: 14px; font-size: 13px; min-height: 18px; }
+      .err { color: #f87171; }
+      .info { color: #8b98a5; }
+    </style>
+  </head>
+  <body>
+    <!-- The app mounts here once decrypted; the gate removes itself. -->
+    <div id="root"></div>
+
+    <div id="gate">
+      <div class="card">
+        <h1>coding-trainer</h1>
+        <p class="sub">This site is encrypted. Enter your passphrase to unlock it on this device.</p>
+        <form id="f" autocomplete="off">
+          <label for="p">Passphrase</label>
+          <input id="p" type="password" autocomplete="current-password" autofocus />
+          <div class="row">
+            <input id="remember" type="checkbox" />
+            <label for="remember">Remember this device</label>
+          </div>
+          <button id="go" type="submit">Unlock</button>
+        </form>
+        <div class="msg" id="msg"></div>
+      </div>
+    </div>
+
+    <script>
+      // Shared crypto for the encrypted-site boot chain.
+//
+// Source of truth. Used directly by Node scripts and vitest, and inlined verbatim
+// into index.html and sw.js at build time (see scripts/encrypt-site.mjs), so the
+// browser boot files stay dependency-free classic scripts.
+//
+// Envelope layout:  "CTENC1" (6 bytes) | IV (12 bytes) | AES-256-GCM ciphertext+tag
+
+const MAGIC = [0x43, 0x54, 0x45, 0x4e, 0x43, 0x31]; // "CTENC1"
+const KDF_ITERATIONS = 600000;
+const SALT_BYTES = 16;
+const IV_BYTES = 12;
+const CANARY_TEXT = 'coding-trainer-ok';
+
+function bytesToB64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+function b64ToBytes(b64) {
+  const s = atob(b64);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+
+function hasMagic(bytes) {
+  if (!bytes || bytes.length < MAGIC.length + IV_BYTES) return false;
+  for (let i = 0; i < MAGIC.length; i++) if (bytes[i] !== MAGIC[i]) return false;
+  return true;
+}
+
+/** PBKDF2-SHA256 -> raw 32-byte key material (kept raw so it can be stored/transferred). */
+async function deriveKeyBytes(passphrase, salt, iterations) {
+  const base = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(passphrase),
+    'PBKDF2',
+    false,
+    ['deriveBits'],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    base,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+async function importAesKey(rawKeyBytes) {
+  return crypto.subtle.importKey('raw', rawKeyBytes, { name: 'AES-GCM' }, false, [
+    'encrypt',
+    'decrypt',
+  ]);
+}
+
+async function encryptBytes(aesKey, plainBytes) {
+  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+  const ct = new Uint8Array(
+    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, plainBytes),
+  );
+  const out = new Uint8Array(MAGIC.length + IV_BYTES + ct.length);
+  out.set(MAGIC, 0);
+  out.set(iv, MAGIC.length);
+  out.set(ct, MAGIC.length + IV_BYTES);
+  return out;
+}
+
+/** Throws if the envelope is malformed or the key is wrong (GCM auth failure). */
+async function decryptEnvelope(aesKey, envelope) {
+  if (!hasMagic(envelope)) throw new Error('not an encrypted envelope');
+  const iv = envelope.subarray(MAGIC.length, MAGIC.length + IV_BYTES);
+  const ct = envelope.subarray(MAGIC.length + IV_BYTES);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, ct);
+  return new Uint8Array(plain);
+}
+
+/** Canary proves the passphrase is right before we navigate into the app. */
+async function makeCanary(aesKey) {
+  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+  const ct = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      aesKey,
+      new TextEncoder().encode(CANARY_TEXT),
+    ),
+  );
+  return { iv_b64: bytesToB64(iv), ct_b64: bytesToB64(ct) };
+}
+
+async function verifyCanary(aesKey, canary) {
+  try {
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: b64ToBytes(canary.iv_b64) },
+      aesKey,
+      b64ToBytes(canary.ct_b64),
+    );
+    return new TextDecoder().decode(plain) === CANARY_TEXT;
+  } catch {
+    return false;
+  }
+}
+
+    </script>
+
+    <script>
+      (function () {
+        var SS_KEY = 'ct.k';
+        var gate = document.getElementById('gate');
+        var form = document.getElementById('f');
+        var pass = document.getElementById('p');
+        var remember = document.getElementById('remember');
+        var button = document.getElementById('go');
+        var msg = document.getElementById('msg');
+        var booted = false;
+
+        function say(text, cls) {
+          msg.className = 'msg ' + (cls || 'info');
+          msg.textContent = text;
+        }
+
+        // --- tiny IndexedDB kv, used only for "remember this device" ---
+        function idbOpen() {
+          return new Promise(function (resolve, reject) {
+            var req = indexedDB.open('ct-unlock', 1);
+            req.onupgradeneeded = function () { req.result.createObjectStore('kv'); };
+            req.onsuccess = function () { resolve(req.result); };
+            req.onerror = function () { reject(req.error); };
+          });
+        }
+        function idbSet(k, v) {
+          return idbOpen().then(function (db) {
+            return new Promise(function (resolve, reject) {
+              var tx = db.transaction('kv', 'readwrite');
+              tx.objectStore('kv').put(v, k);
+              tx.oncomplete = function () { db.close(); resolve(); };
+              tx.onerror = function () { db.close(); reject(tx.error); };
+            });
+          });
+        }
+        function idbGet(k) {
+          return idbOpen().then(function (db) {
+            return new Promise(function (resolve, reject) {
+              var tx = db.transaction('kv', 'readonly');
+              var r = tx.objectStore('kv').get(k);
+              tx.oncomplete = function () { db.close(); resolve(r.result); };
+              tx.onerror = function () { db.close(); reject(tx.error); };
+            });
+          });
+        }
+
+        function loadManifest() {
+          return fetch('manifest.json', { cache: 'no-store' }).then(function (r) {
+            if (!r.ok) throw new Error('manifest.json missing (site not built yet?)');
+            return r.json();
+          });
+        }
+
+        function fetchDecrypted(aesKey, path) {
+          return fetch(path, { cache: 'no-store' })
+            .then(function (r) {
+              if (!r.ok) throw new Error(path + ' -> HTTP ' + r.status);
+              return r.arrayBuffer();
+            })
+            .then(function (buf) { return decryptEnvelope(aesKey, new Uint8Array(buf)); })
+            .then(function (bytes) { return new TextDecoder().decode(bytes); });
+        }
+
+        // Decrypt the app in memory and run it. Nothing readable ever touches the network.
+        function boot(aesKey, keyBytes) {
+          if (booted) return Promise.resolve();
+          booted = true;
+          window.__CT_KEY__ = keyBytes; // handed to the app for decrypting problem files
+          return Promise.all([
+            fetchDecrypted(aesKey, 'assets/app.css'),
+            fetchDecrypted(aesKey, 'assets/app.js'),
+          ]).then(function (parts) {
+            var style = document.createElement('style');
+            style.textContent = parts[0];
+            document.head.appendChild(style);
+
+            gate.remove();
+            document.title = 'coding-trainer';
+
+            var blob = new Blob([parts[1]], { type: 'text/javascript' });
+            var url = URL.createObjectURL(blob);
+            return import(url).finally(function () { URL.revokeObjectURL(url); });
+          });
+        }
+
+        if (!(window.crypto && crypto.subtle)) {
+          say('This browser cannot decrypt the site (WebCrypto requires HTTPS or localhost).', 'err');
+          button.disabled = true;
+          return;
+        }
+
+        var manifestPromise = loadManifest();
+
+        // Silent re-unlock: this tab already has the key, or the device is remembered.
+        manifestPromise
+          .then(function (manifest) {
+            var cached = sessionStorage.getItem(SS_KEY);
+            if (cached) return { manifest: manifest, keyBytes: b64ToBytes(cached) };
+            return idbGet('key').then(function (stored) {
+              if (!stored) return null;
+              var bytes = stored instanceof Uint8Array ? stored : new Uint8Array(stored);
+              sessionStorage.setItem(SS_KEY, bytesToB64(bytes));
+              return { manifest: manifest, keyBytes: bytes };
+            });
+          })
+          .then(function (ctx) {
+            if (!ctx) return;
+            say('Unlocking…');
+            return importAesKey(ctx.keyBytes).then(function (aesKey) {
+              return verifyCanary(aesKey, ctx.manifest.canary).then(function (ok) {
+                if (!ok) {
+                  // Stale key (site redeployed with a new passphrase/salt) — ask again.
+                  sessionStorage.removeItem(SS_KEY);
+                  say('');
+                  return;
+                }
+                return boot(aesKey, ctx.keyBytes);
+              });
+            });
+          })
+          .catch(function () { say(''); });
+
+        form.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var phrase = pass.value;
+          if (!phrase) return;
+          button.disabled = true;
+          say('Deriving key… (deliberately slow)');
+
+          manifestPromise
+            .then(function (manifest) {
+              return deriveKeyBytes(phrase, b64ToBytes(manifest.salt_b64), manifest.iter).then(
+                function (keyBytes) { return { manifest: manifest, keyBytes: keyBytes }; },
+              );
+            })
+            .then(function (ctx) {
+              return importAesKey(ctx.keyBytes).then(function (aesKey) {
+                return verifyCanary(aesKey, ctx.manifest.canary).then(function (ok) {
+                  if (!ok) throw new Error('Wrong passphrase.');
+                  sessionStorage.setItem(SS_KEY, bytesToB64(ctx.keyBytes));
+                  var save = remember.checked ? idbSet('key', ctx.keyBytes) : Promise.resolve();
+                  say('Loading…');
+                  return save.then(function () { return boot(aesKey, ctx.keyBytes); });
+                });
+              });
+            })
+            .catch(function (err) {
+              booted = false;
+              button.disabled = false;
+              pass.select();
+              say(err && err.message ? err.message : 'Unlock failed.', 'err');
+            });
+        });
+      })();
+    </script>
+  </body>
+</html>
