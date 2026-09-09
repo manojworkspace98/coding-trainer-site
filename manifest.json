@@ -1,9 +1,9 @@
 {
   "v": 1,
-  "salt_b64": "0DNcM7r7hZSrisSFWNE1fQ==",
+  "salt_b64": "A1g7G3gZVaTJRqgCkfvDoA==",
   "iter": 600000,
   "canary": {
-    "iv_b64": "G6DBgtNV1X3B6pLH",
-    "ct_b64": "pFZaedqLt9RQuFXospp2A4TM7caJnETb4AdPnWYBc1gS"
+    "iv_b64": "vviXhdxdbWAaLaex",
+    "ct_b64": "qEC/8Rn42lzdG9LRq64FHBl4/BJF3DnFaKWDa5fHxYwf"
   }
 }
